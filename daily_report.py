@@ -11,6 +11,7 @@ import json
 import argparse
 import threading
 from datetime import date, datetime
+from typing import List
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -19,7 +20,7 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox, filedialog, scrolledtext
 
-from claude_reader import read_today_items
+from claude_reader import read_today_items, read_today_sessions, SessionGroup, _find_session_file, _extract_session_context
 import ai_generator
 import email_sender
 
@@ -54,9 +55,9 @@ class DailyReportApp:
         self.root = root
         self.target_date = target_date or date.today()
         self.config = load_config()
-        self.work_items = []      # Claude 读取的所有记录
-        self._visible_items = []  # 当前筛选后显示的记录
-        self.check_vars = []      # 当前可见记录的勾选状态
+        self.sessions: List[SessionGroup] = []  # 今日所有会话
+        self._visible_sessions: List[SessionGroup] = []  # 筛选后的会话
+        self.check_vars = []      # 当前可见会话的勾选状态
         self.custom_items = []    # 手动添加的内容
 
         self._setup_window()
@@ -134,16 +135,18 @@ class DailyReportApp:
         ttk.Button(toolbar, text="⚙ 配置", bootstyle="secondary-outline",
                    command=self._open_settings, width=7).pack(side=RIGHT)
 
-        # 记录列表（带斑马纹）
-        cols = ("time", "project", "content")
+        # 记录列表（按会话展示）
+        cols = ("time", "project", "summary", "msgs")
         self.tree = ttk.Treeview(parent, columns=cols, show="headings",
                                  height=6, selectmode="none")
         self.tree.heading("time", text="时间", anchor="w")
         self.tree.heading("project", text="项目", anchor="w")
-        self.tree.heading("content", text="工作内容", anchor="w")
-        self.tree.column("time", width=70, minwidth=55, stretch=False)
+        self.tree.heading("summary", text="会话摘要", anchor="w")
+        self.tree.heading("msgs", text="消息", anchor="center")
+        self.tree.column("time", width=110, minwidth=90, stretch=False)
         self.tree.column("project", width=160, minwidth=100, stretch=False)
-        self.tree.column("content", width=600, minwidth=200)
+        self.tree.column("summary", width=520, minwidth=200)
+        self.tree.column("msgs", width=50, minwidth=40, stretch=False, anchor="center")
 
         # 斑马纹样式
         self.tree.tag_configure("oddrow", background="#f8f9fa")
@@ -224,45 +227,42 @@ class DailyReportApp:
 
     def _load_records(self):
         history_path = self.config.get('history_path', '~/.claude/history.jsonl')
-        self.work_items = read_today_items(history_path=history_path, target_date=self.target_date)
+        projects_path = self.config.get('projects_path', '~/.claude/projects')
+        self.sessions = read_today_sessions(
+            history_path=history_path,
+            projects_path=projects_path,
+            target_date=self.target_date,
+            load_context=False,
+        )
         self.check_vars.clear()
 
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        # 填充项目筛选下拉框
-        projects = sorted(set(w.project for w in self.work_items))
+        projects = sorted(set(s.project for s in self.sessions))
         self.project_combo['values'] = ["全部"] + projects
         self.project_var.set("全部")
 
-        self._populate_tree(self.work_items)
-
+        self._populate_tree(self.sessions)
         self._update_count()
 
-        if not self.work_items:
-            self.tree.insert("", "end", values=("", "", "📭 今日未找到记录，可点击「＋ 手动添加」"))
+        if not self.sessions:
+            self.tree.insert("", "end", values=("", "", "📭 今日未找到记录，可点击「＋ 手动添加」", ""))
 
-    def _populate_tree(self, items):
-        """用给定的 items 列表填充 Treeview（全选状态）"""
+    def _populate_tree(self, sessions):
         for child in self.tree.get_children():
             self.tree.delete(child)
         self.check_vars.clear()
-        self._visible_items = list(items)
+        self._visible_sessions = list(sessions)
 
-        for i, w in enumerate(self._visible_items):
+        for i, s in enumerate(self._visible_sessions):
             self.check_vars.append(ttk.BooleanVar(value=True))
             tag = "evenrow" if i % 2 == 0 else "oddrow"
+            time_str = f"{s.start_time}-{s.end_time}" if s.start_time != s.end_time else s.start_time
             self.tree.insert("", "end", iid=str(i),
-                             values=("☑ " + w.time, w.project, w.content),
+                             values=("☑ " + time_str, s.project, s.summary, s.msg_count),
                              tags=(tag,))
 
     def _on_project_filter(self, event=None):
-        """项目下拉框选择变化时筛选记录"""
         selected = self.project_var.get()
-        if selected == "全部":
-            filtered = self.work_items
-        else:
-            filtered = [w for w in self.work_items if w.project == selected]
+        filtered = self.sessions if selected == "全部" else [s for s in self.sessions if s.project == selected]
         self._populate_tree(filtered)
         self._update_count()
 
@@ -280,13 +280,14 @@ class DailyReportApp:
         self.check_vars[idx].set(not self.check_vars[idx].get())
         prefix = "☑ " if self.check_vars[idx].get() else "☐ "
 
-        if idx < len(self._visible_items):
-            w = self._visible_items[idx]
-            self.tree.item(item_id, values=(prefix + w.time, w.project, w.content))
+        if idx < len(self._visible_sessions):
+            s = self._visible_sessions[idx]
+            time_str = f"{s.start_time}-{s.end_time}" if s.start_time != s.end_time else s.start_time
+            self.tree.item(item_id, values=(prefix + time_str, s.project, s.summary, s.msg_count))
         else:
-            ci = idx - len(self._visible_items)
+            ci = idx - len(self._visible_sessions)
             if ci < len(self.custom_items):
-                self.tree.item(item_id, values=(prefix + "--:--", "手动添加", self.custom_items[ci]))
+                self.tree.item(item_id, values=(prefix + "--:--", "手动添加", self.custom_items[ci], ""))
 
         self._update_count()
 
@@ -307,13 +308,14 @@ class DailyReportApp:
         iid = str(idx)
         if not self.tree.exists(iid):
             return
-        if idx < len(self._visible_items):
-            w = self._visible_items[idx]
-            self.tree.item(iid, values=(prefix + w.time, w.project, w.content))
+        if idx < len(self._visible_sessions):
+            s = self._visible_sessions[idx]
+            time_str = f"{s.start_time}-{s.end_time}" if s.start_time != s.end_time else s.start_time
+            self.tree.item(iid, values=(prefix + time_str, s.project, s.summary, s.msg_count))
         else:
-            ci = idx - len(self._visible_items)
+            ci = idx - len(self._visible_sessions)
             if ci < len(self.custom_items):
-                self.tree.item(iid, values=(prefix + "--:--", "手动添加", self.custom_items[ci]))
+                self.tree.item(iid, values=(prefix + "--:--", "手动添加", self.custom_items[ci], ""))
 
     def _update_count(self):
         checked = sum(1 for v in self.check_vars if v.get())
@@ -358,15 +360,19 @@ class DailyReportApp:
     # ─── AI 生成 ───
 
     def _get_selected_records(self) -> list:
+        """获取选中会话的完整对话上下文"""
         records = []
         for i, var in enumerate(self.check_vars):
             if not var.get():
                 continue
-            if i < len(self._visible_items):
-                w = self._visible_items[i]
-                records.append(f"[{w.time}] {w.project}: {w.content}")
+            if i < len(self._visible_sessions):
+                s = self._visible_sessions[i]
+                if s.context:
+                    records.append(s.context)
+                else:
+                    records.append(f"[{s.project}] {s.summary}")
             else:
-                ci = i - len(self._visible_items)
+                ci = i - len(self._visible_sessions)
                 if ci < len(self.custom_items):
                     records.append(self.custom_items[ci])
         return records
@@ -378,16 +384,33 @@ class DailyReportApp:
                                    "请先在「⚙ 配置 → AI 接口」中填写 API Key")
             return
 
+        # 先加载选中会话的完整上下文
+        self.btn_generate.configure(state="disabled", text="⏳ 加载上下文...")
+        self.status_label.configure(text="正在读取会话上下文...")
+        self.root.update()
+
+        projects_path = self.config.get('projects_path', '~/.claude/projects')
+        selected_sessions = [self._visible_sessions[i]
+                             for i, var in enumerate(self.check_vars)
+                             if var.get() and i < len(self._visible_sessions)]
+
+        # 有选中的会话但还没有上下文
+        for s in selected_sessions:
+            if not s.context:
+                sf = _find_session_file(s.session_id, os.path.expanduser(projects_path))
+                if sf:
+                    s.context = _extract_session_context(sf)
+
         records = self._get_selected_records()
         if not records:
-            messagebox.showinfo("提示", "请先选择要写入日报的工作记录")
+            messagebox.showinfo("提示", "请先选择要写入日报的会话")
+            self.btn_generate.configure(state="normal", text="🤖  AI 生成日报")
             return
 
         personal = self.config.get('personal', {})
         extra = self.extra_text.get().strip()
 
-        # UI 反馈
-        self.btn_generate.configure(state="disabled", text="⏳ 生成中...")
+        self.btn_generate.configure(state="disabled", text="⏳ AI 生成中...")
         self.status_label.configure(text="正在调用 AI 生成日报，请稍候...")
         self.root.update()
 
